@@ -127,6 +127,94 @@ def upwelling_factor(species: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 魚種別 摂餌時刻プロファイル (日周性 / 夜行性 差別化)
+# ---------------------------------------------------------------------------
+
+
+def species_diurnal_factor(
+    t: datetime,
+    species: str,
+    astro: Dict[str, Any],
+    twilight_window_h: float = 1.5,
+) -> float:
+    """魚種別の摂餌時刻プロファイルによる修飾係数 (中央値 1.0).
+
+    既存の B_twilight (全魚種共通の薄明ボーナス) とは独立に作用させ、
+    日中/夜間/朝夕マヅメに対する魚種ごとの強弱を raw_score に乗算する.
+
+    係数テーブル (v1 ハードコード, v2 で config 化):
+        - madai  : 強い日周性 (朝夕マヅメ依存)。マヅメ +0.30、他はベース
+        - aji    : 夜浮く・昼沈む (JAXA電子タグ調査)。夜 +0.20, 昼 -0.10
+        - tachiuo: 強い夜行性。夜 +0.40, 昼 -0.20
+        - sawara : 昼行性・高速捕食。昼 +0.20, 夜 -0.20
+
+    時間帯判定:
+        - 朝マヅメ: sunrise の前後 twilight_window_h
+        - 夕マヅメ: sunset  の前後 twilight_window_h
+        - 夜間   : sunset + window 〜 翌 sunrise - window
+        - 日中   : sunrise + window 〜 sunset - window
+    """
+    # 魚種ごとの (twilight_bonus, day_delta, night_delta)
+    # 戻り値は 1.0 + delta を返す
+    table = {
+        "madai":   {"twilight": 0.30, "day":  0.00, "night":  0.00},
+        "aji":     {"twilight": 0.00, "day": -0.10, "night":  0.20},
+        "tachiuo": {"twilight": 0.00, "day": -0.20, "night":  0.40},
+        "sawara":  {"twilight": 0.00, "day":  0.20, "night": -0.20},
+    }
+    profile = table.get(species)
+    if profile is None:
+        return 1.0
+
+    sunrise = astro.get("sunrise")
+    sunset = astro.get("sunset")
+
+    def _to_dt(x: Any) -> Optional[datetime]:
+        if x is None:
+            return None
+        if isinstance(x, str):
+            try:
+                x = datetime.fromisoformat(x)
+            except ValueError:
+                return None
+        if not isinstance(x, datetime):
+            return None
+        # tz 揃え
+        if t.tzinfo is not None and x.tzinfo is None:
+            x = x.replace(tzinfo=t.tzinfo)
+        if t.tzinfo is None and x.tzinfo is not None:
+            x = x.replace(tzinfo=None)
+        return x
+
+    sr = _to_dt(sunrise)
+    ss = _to_dt(sunset)
+
+    # sunrise/sunset 不明なら無修飾
+    if sr is None or ss is None:
+        return 1.0
+
+    # 朝夕マヅメ窓に入っているか
+    in_twilight = False
+    for anchor in (sr, ss):
+        diff_h = abs((t - anchor).total_seconds()) / 3600.0
+        if diff_h < twilight_window_h:
+            in_twilight = True
+            break
+
+    if in_twilight:
+        delta = profile["twilight"]
+    else:
+        # 日中 = sunrise + window < t < sunset - window
+        # 夜間 = それ以外
+        is_day = (sr + timedelta(hours=twilight_window_h)) <= t <= (ss - timedelta(hours=twilight_window_h))
+        delta = profile["day"] if is_day else profile["night"]
+
+    factor = 1.0 + delta
+    # 下限ガード (極端に 0 以下にならないよう)
+    return float(max(0.1, factor))
+
+
+# ---------------------------------------------------------------------------
 # 天文ファクター (薄明・月)
 # ---------------------------------------------------------------------------
 
@@ -203,14 +291,24 @@ def compute_obi(
     season_table: Optional[Dict[str, Any]] = None,
     species_list: Optional[List[str]] = None,
     date: Optional[_date_t] = None,
+    weather: Optional[Dict[str, Optional[float]]] = None,
 ) -> pd.DataFrame:
-    """毎時 × 魚種の OBI スコア表を返す."""
+    """毎時 × 魚種の OBI スコア表を返す.
+
+    Args:
+        weather: AMeDAS から取った直近の気象スナップショット (オプション).
+            キー: temp (°C), dT_dt (°C/h), dP_dt (hPa/h).
+            指定された値は hourly_df の同名列が無い／全て NaN のとき
+            「日内一定」として broadcast される。temp_factor / pressure_factor
+            が None を 1.0 として扱う仕様と整合.
+    """
     if hourly_df is None or len(hourly_df) == 0:
         raise ValueError("hourly_df is empty")
 
     weights = {**_default_weights(), **(weights or {})}
     species_list = species_list or ["madai"]
     season_table = season_table or {}
+    weather = weather or {}
 
     df = hourly_df.copy().reset_index(drop=True)
     if "datetime" not in df.columns:
@@ -220,7 +318,19 @@ def compute_obi(
     if "dh_dt" not in df.columns:
         df = compute_dh_dt(df)
 
-    # オプション列
+    # weather スナップショットを「列が無い／全 NaN のとき」だけ broadcast.
+    # hourly_df 側に毎時データが入っていればそちらを優先する.
+    def _broadcast(col: str, val: Optional[float]) -> None:
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return
+        if col not in df.columns or df[col].dropna().empty:
+            df[col] = float(val)
+
+    _broadcast("temp", weather.get("temp"))
+    _broadcast("dT_dt", weather.get("dT_dt"))
+    _broadcast("dP_dt", weather.get("dP_dt"))
+
+    # オプション列 (最終フォールバック: 何も無ければ NaN)
     if "temp" not in df.columns:
         df["temp"] = np.nan
     if "dT_dt" not in df.columns:
@@ -260,6 +370,7 @@ def compute_obi(
         for sp in species_list:
             U = upwelling_factor(sp)
             S = season_factor(dt.month, sp, season_table)
+            D_sp = species_diurnal_factor(dt, sp, astro_daily)
 
             raw = (
                 weights["w2"] * f_dh
@@ -267,7 +378,7 @@ def compute_obi(
                 + weights["w4"] * B
                 + weights["w5"] * M
                 + weights["w6"] * S
-            ) * P_temp * P_press
+            ) * P_temp * P_press * D_sp
 
             rows.append(
                 {
@@ -282,6 +393,7 @@ def compute_obi(
                     "S_season": S,
                     "P_temp": P_temp,
                     "P_pressure": P_press,
+                    "D_species": D_sp,
                     "raw_score": float(raw),
                 }
             )
@@ -319,6 +431,7 @@ def compute_obi(
             "S_season",
             "P_temp",
             "P_pressure",
+            "D_species",
             "raw_score",
             "score_01",
             "stars",
@@ -364,8 +477,10 @@ def _demo() -> pd.DataFrame:
     }
 
     season_table = {
-        "madai": {3: 0.6, 4: 0.8, 5: 1.0, 6: 0.9, 7: 0.6, 10: 0.7, 11: 0.6},
-        "aji": {6: 0.9, 7: 1.0, 8: 1.0, 9: 0.8},
+        "madai":   {3: 0.6, 4: 0.8, 5: 1.0, 6: 0.9, 7: 0.6, 10: 0.7, 11: 0.6},
+        "aji":     {6: 0.9, 7: 1.0, 8: 1.0, 9: 0.8},
+        "tachiuo": {6: 0.7, 7: 0.9, 8: 1.0, 9: 1.0, 10: 0.8},
+        "sawara":  {4: 0.8, 5: 1.0, 6: 0.9, 7: 0.7, 10: 0.8, 11: 0.9},
     }
 
     result = compute_obi(
@@ -375,7 +490,7 @@ def _demo() -> pd.DataFrame:
         lon=132.25,
         weights=None,
         season_table=season_table,
-        species_list=["madai", "aji"],
+        species_list=["madai", "aji", "tachiuo", "sawara"],
         date=_date_t(2026, 6, 19),
     )
     return result
@@ -383,6 +498,45 @@ def _demo() -> pd.DataFrame:
 
 if __name__ == "__main__":
     df = _demo()
-    pd.set_option("display.max_rows", 60)
-    pd.set_option("display.width", 200)
-    print(df.to_string(index=False))
+    pd.set_option("display.max_rows", 200)
+    pd.set_option("display.width", 220)
+
+    # 1) 魚種別 raw_score の代表時刻サマリ (差別化チェック)
+    print("=" * 80)
+    print("species 差別化チェック: 代表時刻ごとの raw_score / D_species")
+    print("=" * 80)
+    # 代表時刻: 03:00 (深夜), 05:00 (朝マヅメ近傍), 12:00 (日中), 19:00 (夕マヅメ近傍), 22:00 (夜間)
+    pick_hours = [3, 5, 12, 19, 22]
+    df["hour"] = pd.to_datetime(df["datetime"]).dt.hour
+    summary = (
+        df[df["hour"].isin(pick_hours)]
+        .pivot_table(
+            index="hour",
+            columns="species",
+            values=["raw_score", "D_species"],
+            aggfunc="first",
+        )
+        .round(3)
+    )
+    print(summary.to_string())
+    print()
+
+    # 2) 魚種ごとに raw_score 合計と最大時刻 (ピーク) を出す
+    print("=" * 80)
+    print("species 別: raw_score 合計・最大値・ピーク時刻")
+    print("=" * 80)
+    for sp, g in df.groupby("species"):
+        g = g.sort_values("datetime")
+        peak_row = g.loc[g["raw_score"].idxmax()]
+        print(
+            f"  {sp:8s}  sum={g['raw_score'].sum():.3f}  "
+            f"max={peak_row['raw_score']:.3f} @ {peak_row['datetime'].strftime('%H:%M')}  "
+            f"stars_peak={int(peak_row['stars'])}"
+        )
+    print()
+
+    # 3) 詳細表
+    print("=" * 80)
+    print("詳細 (全行)")
+    print("=" * 80)
+    print(df.drop(columns=["hour"]).to_string(index=False))

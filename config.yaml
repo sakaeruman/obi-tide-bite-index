@@ -127,3 +127,19 @@ data:
 logging:
   dir: "logs"
   level: "INFO"
+
+# アメダス気象観測（OBI v1: temp_factor / pressure_factor 用）
+# 実物のテーブル (amedastable.json, 2026-06 確認) で確定:
+#   柳井 (Yanai) station_id="82056"  type C   lat 33.9117 lon 132.1083 (沖家室の北側)
+#   防府 (Hofu)  station_id="82066"  type C   lat 34.0667 lon 131.5583
+# どちらも type C のため気圧は取れない (pressure_hpa は NaN)
+# -> dP_dt は None になり pressure_factor は 1.0 にフォールバック
+amedas:
+  station_id: "82056"
+  name: "柳井"
+
+# Discord webhook (秘密情報)
+# 実 URL はここに書かず config.local.yaml に分離して .gitignore で除外する
+# 環境変数 OBI_DISCORD_WEBHOOK でも代用可
+discord:
+  webhook_url: null

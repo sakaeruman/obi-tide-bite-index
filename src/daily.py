@@ -35,10 +35,12 @@ import yaml
 # `python -m src.daily` でも `python src/daily.py` でも動くよう両対応.
 try:
     from . import astro, fetch_tide, obi, render
+    from . import fetch_weather, discord_notify
 except ImportError:  # pragma: no cover - スクリプト直叩き用フォールバック
     _HERE = Path(__file__).resolve().parent
     sys.path.insert(0, str(_HERE.parent))
     from src import astro, fetch_tide, obi, render  # type: ignore
+    from src import fetch_weather, discord_notify  # type: ignore
 
 # ---------------------------------------------------------------------------
 # 定数
@@ -94,10 +96,34 @@ def _build_logger(target_date: date_t) -> logging.Logger:
 # ---------------------------------------------------------------------------
 # 設定ロード
 # ---------------------------------------------------------------------------
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """dict を再帰マージ. override 側を優先."""
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
-    """config.yaml を読んで dict で返す."""
+    """config.yaml を読んで dict で返す.
+
+    同じディレクトリに config.local.yaml があれば後勝ちでマージする.
+    秘密情報 (Discord webhook URL 等) を公開リポと分離する仕組み.
+    """
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
+    local_path = path.parent / "config.local.yaml"
+    if local_path.exists():
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                local_cfg = yaml.safe_load(f) or {}
+            cfg = _deep_merge(cfg, local_cfg)
+        except Exception:
+            sys.stderr.write(f"config.local.yaml の読み込みに失敗 (無視): {local_path}\n")
+            traceback.print_exc(file=sys.stderr)
     return cfg
 
 
@@ -192,6 +218,66 @@ def _step_dh_dt(tide_df: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
     return df
 
 
+def _step_fetch_weather(
+    cfg: Dict[str, Any],
+    logger: logging.Logger,
+) -> Dict[str, Optional[float]]:
+    """AMeDAS から直近気象を取得し {temp, dT_dt, dP_dt} を返す.
+
+    失敗時は全 None を返す (daily.py は続行する).
+    柳井 (82056) は type C のため pressure は常に NaN -> dP_dt=None になる.
+    """
+    snapshot: Dict[str, Optional[float]] = {"temp": None, "dT_dt": None, "dP_dt": None}
+    try:
+        amedas_cfg = cfg.get("amedas") or {}
+        station_id = str(amedas_cfg.get("station_id") or fetch_weather.DEFAULT_STATION_ID)
+        station_name = amedas_cfg.get("name") or "柳井"
+        logger.info("アメダス取得: station_id=%s name=%s", station_id, station_name)
+
+        df = fetch_weather.fetch_recent_weather(station_id=station_id, hours=12)
+        if df is None or df.empty:
+            logger.warning("アメダス取得が空 (続行、補正は 1.0)")
+            return snapshot
+
+        # 最新の有効気温
+        temp_series = pd.to_numeric(df["temp_c"], errors="coerce").dropna()
+        if not temp_series.empty:
+            snapshot["temp"] = float(temp_series.iloc[-1])
+
+            # 直近 1h 変化率: 1時間前の値と差分 (1時間=6サンプル想定だが安全のため時間ベース)
+            try:
+                tail = df.dropna(subset=["temp_c"]).copy()
+                tail["datetime"] = pd.to_datetime(tail["datetime"])
+                end_t = tail["datetime"].max()
+                ref_cut = end_t - pd.Timedelta(hours=1)
+                prev = tail.loc[tail["datetime"] <= ref_cut]
+                if not prev.empty:
+                    t_prev = float(prev["temp_c"].iloc[-1])
+                    dt_h = (end_t - prev["datetime"].iloc[-1]).total_seconds() / 3600.0
+                    if dt_h > 0:
+                        snapshot["dT_dt"] = (snapshot["temp"] - t_prev) / dt_h
+            except Exception:
+                logger.debug("dT_dt 計算失敗 (無視)\n%s", traceback.format_exc())
+
+        # 気圧トレンド (type-C 局では常に 0.0)
+        dp = fetch_weather.compute_pressure_change_rate(df, window_hours=6)
+        # 有効な気圧サンプルが 1 行も無ければ dP_dt は None のまま (1.0 補正)
+        press_series = pd.to_numeric(df["pressure_hpa"], errors="coerce").dropna()
+        if not press_series.empty:
+            snapshot["dP_dt"] = float(dp)
+        else:
+            logger.info("アメダス局に気圧無し (type C) -> dP_dt は補正なし (1.0)")
+
+        logger.info(
+            "アメダス取得 OK: temp=%s dT_dt=%s dP_dt=%s (rows=%d)",
+            snapshot["temp"], snapshot["dT_dt"], snapshot["dP_dt"], len(df),
+        )
+        return snapshot
+    except Exception:
+        logger.error("アメダス取得で例外 (続行、補正は 1.0)\n%s", traceback.format_exc())
+        return {"temp": None, "dT_dt": None, "dP_dt": None}
+
+
 def _step_astro(
     cfg: Dict[str, Any],
     target_date: date_t,
@@ -226,6 +312,7 @@ def _step_compute_obi(
     target_date: date_t,
     species: List[str],
     logger: logging.Logger,
+    weather: Optional[Dict[str, Optional[float]]] = None,
 ) -> pd.DataFrame:
     """compute_obi を叩いて long 形式 (datetime, species, ..., stars) を返す."""
     site = cfg.get("site") or {}
@@ -256,6 +343,7 @@ def _step_compute_obi(
         season_table=season_table,
         species_list=species,
         date=target_date,
+        weather=weather,
     )
     logger.info(
         "OBI 計算 OK: %d 行 (魚種=%d 時間=%d)",
@@ -418,10 +506,14 @@ def run(argv: Optional[List[str]] = None) -> int:
         logger.error("天体計算でエラー (続行)\n%s", traceback.format_exc())
         astro_daily = {}
 
+    # --- 3b. アメダス気象 (失敗しても続行: 全 None で代用) ---
+    weather_snap: Dict[str, Optional[float]] = _step_fetch_weather(cfg, logger)
+
     # --- 4. OBI 本体 ---
     try:
         obi_long = _step_compute_obi(
             hourly_df, astro_daily, cfg, target_date, species, logger,
+            weather=weather_snap,
         )
     except Exception:
         logger.error("OBI 計算で致命エラー\n%s", traceback.format_exc())
@@ -497,6 +589,29 @@ def run(argv: Optional[List[str]] = None) -> int:
         _print_console_summary(render_df, target_date, species)
     except Exception:
         logger.error("コンソールサマリで失敗 (無視)\n%s", traceback.format_exc())
+
+    # --- 8b. Discord 通知 (URL 未設定なら skip。daily 本処理は止めない) ---
+    try:
+        webhook_url = (cfg.get("discord") or {}).get("webhook_url")
+        # null/空文字は無効扱い
+        if isinstance(webhook_url, str) and webhook_url.strip():
+            sent = discord_notify.send_obi_summary(
+                obi_df=obi_long,
+                astro_daily=astro_daily,
+                target_date=target_date,
+                webhook_url=webhook_url,
+            )
+            logger.info("Discord通知: sent=%s", sent)
+        else:
+            # 環境変数 OBI_DISCORD_WEBHOOK のフォールバックを試す
+            sent = discord_notify.send_obi_summary(
+                obi_df=obi_long,
+                astro_daily=astro_daily,
+                target_date=target_date,
+            )
+            logger.info("Discord通知 (env fallback): sent=%s", sent)
+    except Exception:
+        logger.error("Discord通知で例外 (続行)\n%s", traceback.format_exc())
 
     elapsed = time.time() - t0
     logger.info("=== OBI v1 daily done in %.2fs ===", elapsed)
