@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# OBI ローカルキャッシュ・実行時生成物（公開不要）
+data/
+logs/
+out/
+*.parquet
+*.bsp
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# secrets
+.env
+*.local.yaml

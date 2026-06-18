@@ -1,0 +1,50 @@
+name: Daily OBI Update
+
+on:
+  schedule:
+    # 毎日 UTC 20:00 = JST 翌5:00
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-obi-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate latest OBI HTML
+        run: |
+          python3 -m src.daily --no-open
+
+      - name: Copy HTML to docs/
+        run: |
+          mkdir -p docs
+          cp out/latest.html docs/index.html
+          touch docs/.nojekyll
+
+      - name: Commit and push if changed
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "github-actions"
+          git add docs/index.html docs/.nojekyll
+          git diff --quiet --cached || (git commit -m "auto: daily OBI update $(date -u +%Y-%m-%d)" && git push)
